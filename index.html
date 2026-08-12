@@ -1,0 +1,1443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Thought Mapper — Drift Instrument</title>
+
+<!--
+================================================================================
+  THOUGHT MAPPER — DRIFT INSTRUMENT  ·  v3
+================================================================================
+
+  1. DATE CREATED ............ 2026-08-12  (v3 — same day as v2)
+     Lineage .................. anandvip/thought-map (v1, 2024-06-30) → v2 → v3
+
+  2. TOOL / MODEL ............ Claude Opus 5 (Anthropic)
+
+  3. PROMPT USED .............
+     "Shouldn't I be able to edit the persona as well — a better name and a
+      description for wiring them together? Also you are not using toasts or
+      modals to capture intent within the application UI for meta-thinking
+      assistance objects; instead you used the browser alert mechanism and
+      broke the application's own consistent ecosystem by relying on browser
+      features for taking user input. Check and tell me if I am wrong.
+      Also I tried the review export and the comment layer — does the export
+      make sense or do we need to refine and polish it? Fix it."
+
+  4. README .................. see README.md in this repository
+
+--------------------------------------------------------------------------------
+  WHAT CHANGED IN v3
+--------------------------------------------------------------------------------
+  BUG     INK LEAK. v2 bound `input` on the persona field straight to
+          setPersona() → inkFor(), which minted and PERSISTED a new persona
+          on every keystroke. A real user export contained 41 personas —
+          "b", "bi", "bik", "bike", "biker" … — one per character typed, and
+          the 8-colour palette had cycled five times before the actual name
+          was finished, so real voices got arbitrary inks.
+          FIX: personas are committed only at LOG time. The field is a draft
+          until then. Orphan personas (zero thoughts) are pruned on boot and
+          on export.
+
+  BUG     BROWSER DIALOGS. v2 used prompt() to rename a persona and had no
+          confirm path at all. Native dialogs carry no swatch, no description
+          field, no list of existing voices, no scope choice, and cannot
+          express intent — prompt() returns a string. They also break the
+          instrument's own visual world.
+          FIX: every input now happens in-app. A single sheet primitive
+          (bottom sheet on mobile, centred panel on desktop) handles persona
+          editing, the persona manager, settings and confirmations. Zero
+          calls to alert/confirm/prompt anywhere in this file.
+
+  MODEL   Personas are now OBJECTS — { name, description, ink } — not bare
+          strings. Renaming propagates; descriptions wire a voice to what it
+          sounds like. Scope defaults to this-thought-only, with an explicit
+          "apply to all" checkbox, so a corrected misreading does not silently
+          rewrite the record of having been unsure.
+
+  MODEL   SESSIONS. A gap beyond the threshold (default 2h) starts a new
+          session. The ribbon breaks visibly instead of drawing one enormous
+          band across a night's sleep. Dwell that crosses a session boundary
+          is marked OPEN rather than invented.
+
+  MODEL   REVIEW LAYER. Export format v3 carries sessions, persona objects,
+          a reviewer persona, per-session notes, and a per-note PROMOTE flag.
+          A promoted note returns to the stream as a real thought with a
+          parentId back to what it was written about, notched in the ribbon.
+          Unpromoted notes stay commentary and never touch the trace.
+================================================================================
+-->
+
+<style>
+/* ============================================================
+   TOKENS — deep ink-indigo ground, desaturated plotter inks.
+   Undefined is never solid: an unnamed voice reads as interference.
+   ============================================================ */
+:root{
+  --ink:#12141c; --ink-raised:#191c26; --ink-sunk:#0d0f16;
+  --line:#262b3a; --line-bright:#394054;
+  --paper:#e8e6e1; --paper-dim:#a7abbb; --muted:#6c7288;
+  --undefined:#6c7288; --accent:#4e9a96;
+  --mono:ui-monospace,"SF Mono","Cascadia Mono","Roboto Mono",Menlo,Consolas,monospace;
+  --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,"Times New Roman",serif;
+  --r:3px; --pad:clamp(14px,3.5vw,28px); --tap:44px;
+}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--ink);color:var(--paper);font-family:var(--mono);
+  font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased;
+  padding-bottom:env(safe-area-inset-bottom)}
+button,input,textarea,select{font:inherit;color:inherit}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:2px}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+
+/* ---------- MASTHEAD ---------- */
+.masthead{padding:var(--pad) var(--pad) 0;max-width:1240px;margin:0 auto;
+  display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}
+.masthead h1{font-size:clamp(15px,2.4vw,19px);font-weight:500;letter-spacing:.24em;
+  text-transform:uppercase;margin:0}
+.masthead .sub{font-size:11px;letter-spacing:.16em;text-transform:uppercase;
+  color:var(--muted);margin:6px 0 0}
+
+/* ---------- CAPTURE DECK ---------- */
+.deck{position:sticky;top:0;z-index:40;
+  background:linear-gradient(to bottom,var(--ink) 78%,rgba(18,20,28,.94));
+  backdrop-filter:blur(8px);padding:14px var(--pad) 10px;border-bottom:1px solid var(--line)}
+.deck-inner{max-width:1240px;margin:0 auto}
+.channel-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.channel-label{font-size:10px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--muted);flex:0 0 auto}
+.persona-field{position:relative;flex:1 1 190px;min-width:150px;display:flex;align-items:center}
+.persona-swatch{position:absolute;left:9px;width:10px;height:10px;border-radius:50%;
+  pointer-events:none}
+#persona-input{width:100%;min-height:var(--tap);background:var(--ink-sunk);
+  border:1px solid var(--line-bright);border-radius:var(--r);
+  padding:8px 10px 8px 27px;font-size:13px;letter-spacing:.06em}
+#persona-input::placeholder{color:var(--muted)}
+.chips{display:flex;gap:6px;flex-wrap:wrap;flex:1 1 100%}
+.chip{display:inline-flex;align-items:center;gap:6px;background:var(--ink-sunk);
+  border:1px solid var(--line);border-radius:999px;padding:5px 11px;cursor:pointer;
+  font-size:11px;letter-spacing:.08em;color:var(--paper-dim);min-height:32px;
+  transition:border-color .14s,color .14s}
+.chip:hover{border-color:var(--line-bright);color:var(--paper)}
+.chip[aria-pressed="true"]{border-color:currentColor}
+.chip .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+.chip.ghost{color:var(--muted)}
+.compose{display:flex;gap:8px;align-items:flex-end}
+#new-thought{flex:1;min-height:var(--tap);max-height:34vh;resize:none;overflow-y:auto;
+  background:var(--ink-sunk);border:1px solid var(--line-bright);border-radius:var(--r);
+  padding:11px 12px;font-family:var(--serif);font-size:16px;line-height:1.45}
+#new-thought::placeholder{font-family:var(--mono);font-size:13px;color:var(--muted)}
+#add-thought{flex:0 0 auto;min-height:var(--tap);padding:0 16px;background:var(--paper);
+  color:var(--ink);border:0;border-radius:var(--r);font-size:12px;letter-spacing:.14em;
+  text-transform:uppercase;font-weight:600;cursor:pointer}
+#add-thought:hover{opacity:.85}
+#add-thought:disabled{opacity:.3;cursor:not-allowed}
+.hint{font-size:10px;color:var(--muted);letter-spacing:.1em;margin-top:6px}
+.hint b{color:var(--paper-dim);font-weight:500}
+
+/* ---------- DRIFT RIBBON ---------- */
+.instrument{max-width:1240px;margin:0 auto;padding:var(--pad) var(--pad) 0}
+.inst-head{display:flex;justify-content:space-between;align-items:baseline;gap:12px;
+  flex-wrap:wrap;margin-bottom:9px}
+.inst-title{font-size:10px;letter-spacing:.2em;text-transform:uppercase;color:var(--muted)}
+.ribbon{display:flex;flex-wrap:wrap;gap:2px;padding:10px;background:var(--ink-sunk);
+  border:1px solid var(--line);border-radius:var(--r);min-height:44px;
+  align-content:flex-start;align-items:flex-end}
+.seg{height:22px;border:0;padding:0;cursor:pointer;border-radius:1px;
+  transition:transform .12s,filter .12s;transform-origin:center bottom}
+.seg:hover,.seg:focus-visible{transform:scaleY(1.32);filter:brightness(1.3)}
+.seg.is-undefined{background-image:repeating-linear-gradient(45deg,
+  var(--undefined) 0 2px,transparent 2px 5px);background-color:rgba(108,114,136,.18);
+  box-shadow:inset 0 0 0 1px rgba(108,114,136,.5)}
+.seg.is-switch{box-shadow:inset 1px 0 0 var(--paper)}
+.seg.is-open{-webkit-mask-image:linear-gradient(to right,#000 55%,transparent);
+  mask-image:linear-gradient(to right,#000 55%,transparent)}
+.seg.is-note{height:12px;border-radius:6px;opacity:.9}
+.brk{flex:0 0 auto;display:flex;align-items:center;gap:5px;height:22px;
+  padding:0 4px;color:var(--muted);font-size:9px;letter-spacing:.12em;
+  border-left:1px dotted var(--line-bright)}
+.rib-empty{font-size:11px;color:var(--muted);letter-spacing:.1em;padding:6px 2px}
+
+/* ---------- READOUT ---------- */
+.readout{display:grid;gap:1px;background:var(--line);border:1px solid var(--line);
+  border-radius:var(--r);grid-template-columns:repeat(auto-fit,minmax(128px,1fr));
+  margin-top:10px;overflow:hidden}
+.stat{background:var(--ink-raised);padding:11px 13px}
+.stat dt{font-size:9px;letter-spacing:.17em;text-transform:uppercase;color:var(--muted);
+  margin:0 0 5px}
+.stat dd{margin:0;font-size:17px;line-height:1.15}
+.stat dd small{display:block;font-size:10px;color:var(--paper-dim);letter-spacing:.08em;
+  margin-top:3px}
+
+/* ---------- TOOLS ---------- */
+.filters{max-width:1240px;margin:0 auto;padding:var(--pad) var(--pad) 0;
+  display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#search{flex:1 1 190px;min-height:38px;background:var(--ink-sunk);
+  border:1px solid var(--line);border-radius:var(--r);padding:7px 11px;font-size:13px}
+.tool{min-height:38px;padding:0 13px;cursor:pointer;background:transparent;
+  border:1px solid var(--line);border-radius:var(--r);color:var(--paper-dim);
+  font-size:11px;letter-spacing:.12em;text-transform:uppercase;
+  transition:border-color .14s,color .14s}
+.tool:hover{border-color:var(--line-bright);color:var(--paper)}
+
+/* ---------- CARDS ---------- */
+.field{max-width:1240px;margin:0 auto;padding:16px var(--pad) 90px;columns:3;column-gap:14px}
+@media(max-width:1000px){.field{columns:2}}
+@media(max-width:640px){.field{columns:1}}
+.card{break-inside:avoid;-webkit-column-break-inside:avoid;background:var(--ink-raised);
+  border:1px solid var(--line);border-left:3px solid var(--undefined);border-radius:var(--r);
+  margin:0 0 14px;padding:12px 13px;animation:rise .22s ease-out both}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+.card.undef{border-left-style:dashed;background-image:repeating-linear-gradient(45deg,
+  rgba(108,114,136,.045) 0 6px,transparent 6px 13px)}
+.card.is-note{border-style:dotted;border-left-style:solid}
+.card-head{display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-bottom:8px}
+.card-persona{font-size:10px;letter-spacing:.15em;text-transform:uppercase;cursor:pointer;
+  background:none;border:0;padding:2px 0;border-bottom:1px dotted currentColor}
+.card-time{font-size:10px;color:var(--muted);letter-spacing:.07em;margin-left:auto}
+.tag{font-size:9px;letter-spacing:.13em;text-transform:uppercase;padding:1px 5px;
+  border-radius:2px;background:var(--paper);color:var(--ink)}
+.tag.soft{background:transparent;color:var(--muted);border:1px solid var(--line)}
+.card-desc{font-size:10px;color:var(--muted);letter-spacing:.04em;line-height:1.4;
+  margin:-3px 0 8px;font-style:italic}
+.card-text{width:100%;background:transparent;border:0;border-radius:2px;padding:2px 0;
+  resize:none;overflow:hidden;font-family:var(--serif);font-size:16px;line-height:1.5;
+  color:var(--paper)}
+.card-text:focus{outline:0;background:var(--ink-sunk);padding:6px 8px;
+  box-shadow:inset 0 0 0 1px var(--line-bright)}
+.card-parent{font-size:10px;color:var(--muted);border-left:2px solid var(--line);
+  padding:3px 0 3px 8px;margin:8px 0 0;font-family:var(--serif);font-style:italic}
+.card-foot{display:flex;gap:5px;align-items:center;margin-top:9px;opacity:.42;
+  transition:opacity .14s}
+.card:hover .card-foot,.card:focus-within .card-foot{opacity:1}
+.mini{background:none;border:1px solid var(--line);border-radius:2px;color:var(--paper-dim);
+  cursor:pointer;font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+  padding:5px 8px;min-height:30px}
+.mini:hover{border-color:var(--line-bright);color:var(--paper)}
+.card-dwell{font-size:10px;color:var(--muted);margin-left:auto;letter-spacing:.07em}
+
+/* ---------- EMPTY ---------- */
+.empty{max-width:520px;margin:8vh auto;padding:0 0 0 20px;border-left:2px solid var(--line)}
+.empty h2{font-family:var(--serif);font-size:21px;font-weight:400;margin:0 0 10px}
+.empty p{color:var(--paper-dim);font-size:13px;line-height:1.65;margin:0 0 8px}
+
+/* ============================================================
+   SHEET — the one input primitive. Replaces every browser dialog.
+   Bottom sheet on narrow screens, centred panel on wide.
+   ============================================================ */
+.scrim{position:fixed;inset:0;z-index:60;background:rgba(8,9,14,.72);
+  backdrop-filter:blur(3px);opacity:0;pointer-events:none;transition:opacity .2s;
+  display:flex;align-items:flex-end;justify-content:center}
+.scrim.open{opacity:1;pointer-events:auto}
+@media(min-width:700px){.scrim{align-items:center}}
+.sheet{width:100%;max-width:520px;max-height:88vh;overflow-y:auto;
+  background:var(--ink-raised);border:1px solid var(--line-bright);
+  border-radius:var(--r) var(--r) 0 0;padding:18px var(--pad)
+    calc(18px + env(safe-area-inset-bottom));
+  transform:translateY(18px);transition:transform .22s cubic-bezier(.2,.9,.3,1)}
+.scrim.open .sheet{transform:none}
+@media(min-width:700px){.sheet{border-radius:var(--r);margin:0 14px}}
+.sheet h2{font-size:12px;letter-spacing:.2em;text-transform:uppercase;font-weight:500;
+  margin:0 0 4px}
+.sheet .lede{font-size:12px;color:var(--paper-dim);line-height:1.55;margin:0 0 16px}
+.fld{margin-bottom:14px}
+.fld label{display:block;font-size:9px;letter-spacing:.17em;text-transform:uppercase;
+  color:var(--muted);margin-bottom:6px}
+.fld input[type=text],.fld textarea,.fld input[type=number]{width:100%;
+  background:var(--ink-sunk);border:1px solid var(--line);border-radius:var(--r);
+  padding:10px 11px;font-size:14px;min-height:var(--tap)}
+.fld textarea{font-family:var(--serif);line-height:1.5;resize:vertical;min-height:70px}
+.fld .help{font-size:10px;color:var(--muted);margin:6px 0 0;line-height:1.5}
+.inks{display:flex;gap:7px;flex-wrap:wrap}
+.ink-opt{width:34px;height:34px;border-radius:50%;border:2px solid transparent;
+  cursor:pointer;padding:0}
+.ink-opt[aria-pressed="true"]{border-color:var(--paper)}
+.scope{display:flex;gap:9px;align-items:flex-start;background:var(--ink-sunk);
+  border:1px solid var(--line);border-radius:var(--r);padding:11px 12px;cursor:pointer}
+.scope input{margin:2px 0 0;width:17px;height:17px;flex:0 0 auto;accent-color:var(--accent)}
+.scope span{font-size:12px;line-height:1.5;color:var(--paper-dim)}
+.scope b{color:var(--paper);font-weight:500}
+.sheet-acts{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:18px}
+.btn{min-height:var(--tap);padding:0 17px;border-radius:var(--r);cursor:pointer;
+  font-size:11px;letter-spacing:.13em;text-transform:uppercase;border:1px solid var(--line)}
+.btn.ghost{background:transparent;color:var(--paper-dim)}
+.btn.ghost:hover{border-color:var(--line-bright);color:var(--paper)}
+.btn.solid{background:var(--paper);color:var(--ink);border-color:var(--paper);font-weight:600}
+.btn.danger{background:transparent;color:#c4667f;border-color:#5a3540}
+.btn.danger:hover{background:#c4667f;color:var(--ink)}
+.plist{display:flex;flex-direction:column;gap:1px;background:var(--line);
+  border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin-bottom:4px}
+.prow{display:flex;align-items:center;gap:10px;background:var(--ink-sunk);
+  padding:11px 12px;cursor:pointer;text-align:left;border:0;width:100%;min-height:var(--tap)}
+.prow:hover{background:#11141d}
+.prow .dot{width:10px;height:10px;border-radius:50%;flex:0 0 auto}
+.prow .nm{font-size:12px;letter-spacing:.08em}
+.prow .ds{font-size:10px;color:var(--muted);font-style:italic;margin-top:2px;
+  font-family:var(--serif)}
+.prow .ct{margin-left:auto;font-size:10px;color:var(--muted);flex:0 0 auto}
+
+/* ---------- TOAST ---------- */
+.toast{position:fixed;left:50%;bottom:calc(20px + env(safe-area-inset-bottom));
+  transform:translate(-50%,150%);background:var(--ink-raised);
+  border:1px solid var(--line-bright);border-radius:var(--r);padding:10px 14px;z-index:80;
+  display:flex;gap:12px;align-items:center;font-size:12px;letter-spacing:.06em;
+  box-shadow:0 8px 30px rgba(0,0,0,.6);
+  transition:transform .24s cubic-bezier(.2,.9,.3,1);max-width:calc(100vw - 28px)}
+.toast.show{transform:translate(-50%,0)}
+.toast button{background:none;border:0;color:var(--accent);cursor:pointer;font-size:11px;
+  letter-spacing:.12em;text-transform:uppercase;padding:6px}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+
+<body>
+
+<header class="masthead">
+  <div>
+    <h1>Thought Mapper</h1>
+    <p class="sub">Drift instrument — persona stamped at capture</p>
+  </div>
+  <button class="tool" id="btn-voices">Voices</button>
+</header>
+
+<section class="deck" aria-label="Capture">
+  <div class="deck-inner">
+    <div class="channel-row">
+      <span class="channel-label">Speaking</span>
+      <span class="persona-field">
+        <span class="persona-swatch" id="persona-swatch"></span>
+        <input id="persona-input" type="text" autocomplete="off" spellcheck="false"
+               placeholder="Undefined" aria-label="Persona speaking right now">
+      </span>
+      <div class="chips" id="persona-chips"></div>
+    </div>
+    <div class="compose">
+      <textarea id="new-thought" rows="1" placeholder="What just arrived?"></textarea>
+      <button id="add-thought" disabled>Log</button>
+    </div>
+    <p class="hint"><b>Ctrl/⌘ + Enter</b> to log · blank persona logs as Undefined ·
+      the name is a draft until you log</p>
+  </div>
+</section>
+
+<section class="instrument" aria-label="Drift readout">
+  <div class="inst-head">
+    <span class="inst-title">Drift ribbon — width is dwell, hatching is Undefined</span>
+    <span class="inst-title" id="ribbon-range"></span>
+  </div>
+  <div class="ribbon" id="ribbon"></div>
+  <dl class="readout" id="readout"></dl>
+</section>
+
+<div class="filters">
+  <input id="search" type="search" placeholder="Search thoughts…" aria-label="Search thoughts">
+  <button class="tool" id="btn-export-html">Export review page</button>
+  <button class="tool" id="btn-export-json">Backup JSON</button>
+  <button class="tool" id="btn-import">Restore</button>
+  <button class="tool" id="btn-settings">Settings</button>
+  <input type="file" id="file-input" accept="application/json" hidden>
+</div>
+
+<main class="field" id="field" aria-live="polite"></main>
+
+<div class="scrim" id="scrim" role="dialog" aria-modal="true" aria-labelledby="sheet-title">
+  <div class="sheet" id="sheet"></div>
+</div>
+
+<div class="toast" id="toast" role="status">
+  <span id="toast-msg"></span>
+  <button id="toast-action" hidden></button>
+</div>
+
+<script>
+"use strict";
+
+/* ============================================================
+   CONSTANTS
+   ============================================================ */
+const CHANNELS = ['#c8944b','#4e9a96','#8b7bb8','#c4667f','#7a9a5b','#5b82b5','#b5794e','#5f9ac0'];
+const UNDEFINED = 'Undefined';
+const UNDEF_INK = '#6c7288';
+const DEFAULT_GAP = 2 * 60 * 60 * 1000;   // 2h → new session
+
+let db = null;
+let thoughts = [];                 // ascending by createdAt
+let personas = {};                 // { name: {name, description, ink, createdAt} }
+let settings = { sessionGapMs: DEFAULT_GAP, reviewerPersona: '' };
+let draftPersona = UNDEFINED;      // NOT committed until log — the v2 ink leak fix
+let filterPersona = null;
+let searchTerm = '';
+let toastTimer = null;
+
+/* ============================================================
+   STORAGE
+   ============================================================ */
+function openDB(){
+  return new Promise((resolve,reject)=>{
+    const req = indexedDB.open('ThoughtMapperDB',3);
+    req.onupgradeneeded = e=>{
+      const d = e.target.result, tr = e.target.transaction;
+      if(!d.objectStoreNames.contains('thoughts')){
+        const s = d.createObjectStore('thoughts',{keyPath:'id'});
+        s.createIndex('persona','persona',{unique:false});
+        s.createIndex('createdAt','createdAt',{unique:false});
+      }
+      if(!d.objectStoreNames.contains('meta')) d.createObjectStore('meta',{keyPath:'key'});
+      if(!d.objectStoreNames.contains('personas')) d.createObjectStore('personas',{keyPath:'name'});
+
+      // v1 blob → individual records, retrofitting the persona that was
+      // only ever a global field.
+      if(d.objectStoreNames.contains('persona')){
+        tr.objectStore('persona').get(1).onsuccess = ev=>{
+          const rec = ev.target.result;
+          if(!rec || !Array.isArray(rec.thoughts)) return;
+          const name = (rec.name||'').trim() || UNDEFINED;
+          const store = tr.objectStore('thoughts');
+          rec.thoughts.forEach(t=>store.put({
+            id:String(t.id), text:t.text||'', persona:name,
+            createdAt:Number(t.id)||Date.now(), editedAt:null,
+            sessionId:null, parentId:null, kind:'thought'
+          }));
+        };
+      }
+    };
+    req.onsuccess = e=>resolve(e.target.result);
+    req.onerror  = e=>reject(e.target.error);
+  });
+}
+const store = (n,m)=>db.transaction([n],m).objectStore(n);
+const wrap = r=>new Promise((res,rej)=>{r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});
+
+const putThought    = t   => wrap(store('thoughts','readwrite').put(t));
+const removeThought = id  => wrap(store('thoughts','readwrite').delete(id));
+const readThoughts  = ()  => wrap(store('thoughts','readonly').getAll()).then(r=>r||[]);
+const putPersona    = p   => wrap(store('personas','readwrite').put(p));
+const dropPersona   = n   => wrap(store('personas','readwrite').delete(n));
+const readPersonas  = ()  => wrap(store('personas','readonly').getAll()).then(r=>r||[]);
+const putMeta       = (k,v)=> wrap(store('meta','readwrite').put({key:k,value:v}));
+const readMeta      = k   => wrap(store('meta','readonly').get(k)).then(r=>r?r.value:null);
+
+/* ============================================================
+   PERSONAS — objects, not strings. Committed only at log time.
+   ============================================================ */
+function normName(raw){
+  const v = (raw||'').trim().replace(/\s+/g,' ');
+  return v || UNDEFINED;
+}
+function nextInk(){
+  const used = Object.values(personas).map(p=>p.ink);
+  const free = CHANNELS.find(c=>!used.includes(c));
+  return free || CHANNELS[Object.keys(personas).length % CHANNELS.length];
+}
+function inkOf(name){
+  if(name === UNDEFINED) return UNDEF_INK;
+  return (personas[name] && personas[name].ink) || UNDEF_INK;
+}
+function descOf(name){
+  return (personas[name] && personas[name].description) || '';
+}
+/** Commit a persona to storage. Called ONLY on log / explicit edit. */
+async function commitPersona(name, patch){
+  if(name === UNDEFINED) return;
+  const existing = personas[name];
+  const p = Object.assign(
+    { name, description:'', ink: existing ? existing.ink : nextInk(), createdAt: Date.now() },
+    existing || {}, patch || {}, { name }
+  );
+  personas[name] = p;
+  await putPersona(p);
+}
+function countOf(name){ return thoughts.filter(t=>t.persona===name).length; }
+/** Remove personas no thought references — cleans up any legacy ink leak. */
+async function pruneOrphans(){
+  const live = new Set(thoughts.map(t=>t.persona));
+  const dead = Object.keys(personas).filter(n=>!live.has(n));
+  for(const n of dead){ delete personas[n]; await dropPersona(n); }
+  return dead.length;
+}
+
+/* ============================================================
+   SESSIONS
+   ============================================================ */
+function resequence(){
+  thoughts.sort((a,b)=>a.createdAt-b.createdAt);
+  let sid = null, prev = null;
+  thoughts.forEach(t=>{
+    if(!prev || (t.createdAt - prev.createdAt) > settings.sessionGapMs){
+      sid = 's' + t.createdAt;
+    }
+    t.sessionId = sid;
+    prev = t;
+  });
+}
+/** Returns {ms, open} — open means the next thought is in another session,
+ *  so the true dwell is unknown rather than enormous. */
+function dwellOf(i){
+  const t = thoughts[i], n = thoughts[i+1];
+  if(!n) return { ms: Math.min(Date.now()-t.createdAt, settings.sessionGapMs), open:true };
+  if(n.sessionId !== t.sessionId) return { ms: settings.sessionGapMs/6, open:true };
+  return { ms: n.createdAt - t.createdAt, open:false };
+}
+function humanGap(ms){
+  const s=Math.round(ms/1000); if(s<60) return s+'s';
+  const m=Math.round(s/60);    if(m<60) return m+'m';
+  const h=Math.round(m/60);    if(h<48) return h+'h';
+  return Math.round(h/24)+'d';
+}
+function clockOf(ts){
+  return new Date(ts).toLocaleString(undefined,
+    {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+}
+
+/* ============================================================
+   METRICS — descriptive only. No score, no streak.
+   ============================================================ */
+function metrics(){
+  const n = thoughts.length; if(!n) return null;
+  let switches=0, longest=0, run=1; const cuts={};
+  for(let i=1;i<n;i++){
+    if(thoughts[i].persona !== thoughts[i-1].persona){
+      switches++; cuts[thoughts[i].persona]=(cuts[thoughts[i].persona]||0)+1;
+      longest=Math.max(longest,run); run=1;
+    } else run++;
+  }
+  longest=Math.max(longest,run);
+  const top = Object.entries(cuts).sort((a,b)=>b[1]-a[1])[0]||null;
+  const undef = thoughts.filter(t=>t.persona===UNDEFINED).length;
+  const gaps = thoughts.map((_,i)=>dwellOf(i)).filter(d=>!d.open)
+                       .map(d=>d.ms).sort((a,b)=>a-b);
+  return {
+    n, switches, rate: n>1?Math.round(switches/(n-1)*100):0, longest, top,
+    undef, undefPct: Math.round(undef/n*100),
+    median: gaps.length?gaps[Math.floor(gaps.length/2)]:0,
+    voices: new Set(thoughts.map(t=>t.persona)).size,
+    sessions: new Set(thoughts.map(t=>t.sessionId)).size
+  };
+}
+
+/* ============================================================
+   SHEET PRIMITIVE — every input lives here. No alert/confirm/prompt.
+   ============================================================ */
+let sheetPrev = null;
+function closeSheet(){
+  document.getElementById('scrim').classList.remove('open');
+  document.getElementById('sheet').textContent='';
+  if(sheetPrev && sheetPrev.focus) sheetPrev.focus();
+  sheetPrev = null;
+}
+function openSheet(build){
+  const scrim = document.getElementById('scrim');
+  const sheet = document.getElementById('sheet');
+  sheetPrev = document.activeElement;
+  sheet.textContent='';
+  build(sheet);
+  scrim.classList.add('open');
+  const first = sheet.querySelector('input,textarea,button');
+  if(first) setTimeout(()=>first.focus(),60);
+}
+document.getElementById('scrim').addEventListener('click',e=>{
+  if(e.target.id==='scrim') closeSheet();
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape' && document.getElementById('scrim').classList.contains('open')) closeSheet();
+});
+
+function el(tag,cls,text){
+  const n=document.createElement(tag);
+  if(cls) n.className=cls;
+  if(text!=null) n.textContent=text;
+  return n;
+}
+function head(sheet,title,lede){
+  const h=el('h2',null,title); h.id='sheet-title';
+  sheet.appendChild(h);
+  if(lede) sheet.appendChild(el('p','lede',lede));
+}
+function field(label,control,help){
+  const f=el('div','fld');
+  const l=el('label',null,label);
+  l.htmlFor = control.id || '';
+  f.append(l,control);
+  if(help) f.appendChild(el('p','help',help));
+  return f;
+}
+function acts(sheet,list){
+  const bar=el('div','sheet-acts');
+  list.forEach(([label,kind,fn])=>{
+    const b=el('button','btn '+kind,label);
+    b.addEventListener('click',fn);
+    bar.appendChild(b);
+  });
+  sheet.appendChild(bar);
+}
+
+/** In-app replacement for confirm(). */
+function askConfirm(title,lede,confirmLabel,onYes,danger){
+  openSheet(sheet=>{
+    head(sheet,title,lede);
+    acts(sheet,[
+      ['Cancel','ghost',closeSheet],
+      [confirmLabel, danger?'danger':'solid', ()=>{ closeSheet(); onYes(); }]
+    ]);
+  });
+}
+
+/* ---------- persona editor ---------- */
+function inkPicker(current,onPick){
+  const box = el('div','inks');
+  CHANNELS.forEach(c=>{
+    const b=el('button','ink-opt'); b.type='button';
+    b.style.background=c;
+    b.setAttribute('aria-pressed',String(c===current));
+    b.setAttribute('aria-label','Ink '+c);
+    b.addEventListener('click',()=>{
+      current=c; onPick(c);
+      [...box.children].forEach(x=>x.setAttribute('aria-pressed',
+        String(x.style.backgroundColor===b.style.backgroundColor)));
+    });
+    box.appendChild(b);
+  });
+  return box;
+}
+
+function editPersonaSheet(thought){
+  const original = thought ? thought.persona : null;
+  const isUndef = original === UNDEFINED;
+  const count = original ? countOf(original) : 0;
+  let ink = original && !isUndef ? inkOf(original) : nextInk();
+  let applyAll = false;
+
+  openSheet(sheet=>{
+    head(sheet, thought ? 'Who was speaking?' : 'New voice',
+      thought
+        ? 'Leave the name blank to return this thought to Undefined. An unnamed voice is a real reading, not a gap.'
+        : 'Name a voice and say what it sounds like.');
+
+    const nameIn = el('input'); nameIn.type='text'; nameIn.id='p-name';
+    nameIn.autocomplete='off'; nameIn.spellcheck=false;
+    nameIn.placeholder = UNDEFINED;
+    nameIn.value = isUndef ? '' : (original || '');
+    sheet.appendChild(field('Name', nameIn));
+
+    const descIn = el('textarea'); descIn.id='p-desc'; descIn.rows=3;
+    descIn.placeholder='What does this voice sound like? What does it want?';
+    descIn.value = original ? descOf(original) : '';
+    sheet.appendChild(field('Description', descIn,
+      'Wired to the voice, not to this thought — it shows on every card this persona stamps.'));
+
+    const pick = inkPicker(ink, c=>{ink=c;});
+    sheet.appendChild(field('Ink', pick,
+      'Undefined has no ink — it is drawn as hatching wherever it appears.'));
+
+    if(thought && count > 1){
+      const lab = el('label','scope');
+      const cb = el('input'); cb.type='checkbox';
+      cb.addEventListener('change',()=>{applyAll=cb.checked});
+      const sp = el('span');
+      sp.appendChild(el('b','Apply to all ' + count + ' thoughts by ' + original));
+      sp.appendChild(document.createTextNode(
+        ' — otherwise only this one is re-stamped, and the record of having been unsure stays intact.'));
+      lab.append(cb,sp);
+      sheet.appendChild(lab);
+    }
+
+    acts(sheet,[
+      ['Cancel','ghost',closeSheet],
+      ['Save','solid', async ()=>{
+        const name = normName(nameIn.value);
+        const desc = descIn.value.trim();
+        closeSheet();
+        if(name !== UNDEFINED) await commitPersona(name,{description:desc, ink});
+        if(!thought){ setDraft(name); renderAll(); flash('Voice ready: ' + name); return; }
+
+        const targets = (applyAll && original)
+          ? thoughts.filter(t=>t.persona===original) : [thought];
+        for(const t of targets){ t.persona = name; await putThought(t); }
+        await pruneOrphans();
+        renderAll();
+        flash(targets.length>1
+          ? targets.length + ' thoughts re-stamped ' + name
+          : 'Now stamped ' + name);
+      }]
+    ]);
+  });
+}
+
+/* ---------- voices manager ---------- */
+function voicesSheet(){
+  openSheet(sheet=>{
+    const list = [...new Set(thoughts.map(t=>t.persona))]
+      .map(n=>[n,countOf(n)]).sort((a,b)=>b[1]-a[1]);
+    head(sheet,'Voices',
+      list.length ? 'Tap a voice to rename it, describe it, or change its ink. Edits here apply to every thought it stamps.'
+                  : 'No voices yet. Log a thought and whoever is speaking gets recorded.');
+
+    if(list.length){
+      const box = el('div','plist');
+      list.forEach(([name,count])=>{
+        const row = el('button','prow'); row.type='button';
+        const dot = el('span','dot');
+        if(name===UNDEFINED){
+          dot.style.background='transparent';
+          dot.style.boxShadow='inset 0 0 0 1px '+UNDEF_INK;
+        } else dot.style.background = inkOf(name);
+        const mid = el('span');
+        mid.appendChild(el('span','nm',name));
+        const d = descOf(name);
+        if(d) mid.appendChild(el('span','ds',d));
+        else if(name===UNDEFINED) mid.appendChild(el('span','ds','not yet recognised'));
+        mid.firstChild.style.display='block';
+        const ct = el('span','ct',count);
+        row.append(dot,mid,ct);
+        row.addEventListener('click',()=>{
+          if(name===UNDEFINED){ flash('Undefined is a reading — rename it per thought'); return; }
+          renameVoiceSheet(name,count);
+        });
+        box.appendChild(row);
+      });
+      sheet.appendChild(box);
+    }
+    acts(sheet,[['Done','ghost',closeSheet]]);
+  });
+}
+
+function renameVoiceSheet(name,count){
+  let ink = inkOf(name);
+  openSheet(sheet=>{
+    head(sheet, name, 'Applies to all ' + count + ' thought' + (count===1?'':'s') + ' this voice stamps.');
+    const nameIn = el('input'); nameIn.type='text'; nameIn.id='v-name'; nameIn.value=name;
+    nameIn.autocomplete='off'; nameIn.spellcheck=false;
+    sheet.appendChild(field('Name', nameIn));
+    const descIn = el('textarea'); descIn.id='v-desc'; descIn.rows=3;
+    descIn.value = descOf(name);
+    descIn.placeholder='What does this voice sound like? What does it want?';
+    sheet.appendChild(field('Description', descIn));
+    sheet.appendChild(field('Ink', inkPicker(ink,c=>{ink=c}), null));
+
+    acts(sheet,[
+      ['Cancel','ghost',closeSheet],
+      ['Save','solid', async ()=>{
+        const next = normName(nameIn.value);
+        const desc = descIn.value.trim();
+        closeSheet();
+        if(next === UNDEFINED){
+          for(const t of thoughts.filter(t=>t.persona===name)){
+            t.persona = UNDEFINED; await putThought(t);
+          }
+        } else {
+          await commitPersona(next,{description:desc, ink});
+          if(next !== name){
+            for(const t of thoughts.filter(t=>t.persona===name)){
+              t.persona = next; await putThought(t);
+            }
+          }
+        }
+        await pruneOrphans();
+        renderAll(); flash('Voice updated');
+      }]
+    ]);
+  });
+}
+
+/* ---------- settings ---------- */
+function settingsSheet(){
+  openSheet(sheet=>{
+    head(sheet,'Settings','Session boundary and reviewer identity.');
+    const gapIn = el('input'); gapIn.type='number'; gapIn.id='s-gap';
+    gapIn.min='0.1'; gapIn.step='0.1';
+    gapIn.value = String(Math.round(settings.sessionGapMs/360000)/10);
+    sheet.appendChild(field('Session gap (hours)', gapIn,
+      'A silence longer than this starts a new session, so the ribbon breaks instead of drawing one huge band across a night.'));
+
+    const revIn = el('input'); revIn.type='text'; revIn.id='s-rev';
+    revIn.value = settings.reviewerPersona||'';
+    revIn.placeholder='e.g. the one reading this back';
+    sheet.appendChild(field('Reviewer persona', revIn,
+      'Stamped on review notes in the exported page. The observer has a persona too.'));
+
+    acts(sheet,[
+      ['Cancel','ghost',closeSheet],
+      ['Danger zone','danger',()=>{ closeSheet(); wipeSheet(); }],
+      ['Save','solid', async()=>{
+        const h = parseFloat(gapIn.value);
+        settings.sessionGapMs = (isFinite(h)&&h>0 ? h : 2) * 3600000;
+        settings.reviewerPersona = revIn.value.trim();
+        await putMeta('settings',settings);
+        closeSheet(); renderAll(); flash('Settings saved');
+      }]
+    ]);
+  });
+}
+function wipeSheet(){
+  askConfirm('Erase everything?',
+    'All ' + thoughts.length + ' thoughts and every voice will be deleted from this browser. Back up first — this cannot be undone.',
+    'Erase all', async()=>{
+      for(const t of thoughts.slice()) await removeThought(t.id);
+      for(const n of Object.keys(personas)) await dropPersona(n);
+      thoughts=[]; personas={}; renderAll(); flash('Everything erased');
+    }, true);
+}
+
+/* ============================================================
+   RENDER — RIBBON
+   ============================================================ */
+function renderRibbon(){
+  const el_ = document.getElementById('ribbon');
+  const range = document.getElementById('ribbon-range');
+  el_.textContent='';
+  if(!thoughts.length){
+    el_.appendChild(el('p','rib-empty','No signal yet.'));
+    range.textContent=''; return;
+  }
+  const d = thoughts.map((_,i)=>dwellOf(i));
+  const max = Math.max(...d.map(x=>x.ms),1);
+
+  thoughts.forEach((t,i)=>{
+    if(i>0 && t.sessionId !== thoughts[i-1].sessionId){
+      const b = el('span','brk','⟋ ' + humanGap(t.createdAt - thoughts[i-1].createdAt));
+      b.title = 'Session break — ' + humanGap(t.createdAt - thoughts[i-1].createdAt) + ' of silence';
+      el_.appendChild(b);
+    }
+    const seg = el('button','seg');
+    seg.style.width = Math.round(9 + Math.sqrt(d[i].ms/max)*92) + 'px';
+    if(t.persona===UNDEFINED) seg.classList.add('is-undefined');
+    else seg.style.background = inkOf(t.persona);
+    if(i>0 && thoughts[i-1].persona!==t.persona && thoughts[i-1].sessionId===t.sessionId)
+      seg.classList.add('is-switch');
+    if(d[i].open) seg.classList.add('is-open');
+    if(t.kind==='note') seg.classList.add('is-note');
+    seg.title = t.persona + (t.kind==='note'?' (returned note)':'')
+      + ' · held ' + humanGap(d[i].ms) + (d[i].open?' (open)':'')
+      + ' · ' + clockOf(t.createdAt);
+    seg.setAttribute('aria-label',seg.title);
+    seg.addEventListener('click',()=>{
+      const card = document.querySelector('[data-id="'+t.id+'"]');
+      if(card){
+        card.scrollIntoView({behavior:'smooth',block:'center'});
+        card.style.borderColor='var(--paper)';
+        setTimeout(()=>{card.style.borderColor=''},1100);
+      }
+    });
+    el_.appendChild(seg);
+  });
+  const m = metrics();
+  range.textContent = clockOf(thoughts[0].createdAt) + '  →  now  ·  ' +
+    m.sessions + (m.sessions===1?' session':' sessions');
+}
+
+/* ============================================================
+   RENDER — READOUT
+   ============================================================ */
+function renderReadout(){
+  const box = document.getElementById('readout');
+  box.textContent='';
+  const m = metrics(); if(!m) return;
+  [
+    ['Thoughts logged', m.n, m.voices + (m.voices===1?' voice':' voices')],
+    ['Switch rate', m.rate+'%', m.switches+' handovers'],
+    ['Longest hold', m.longest, 'thoughts uninterrupted'],
+    ['Typical gap', humanGap(m.median), 'within a session'],
+    ['Interrupts most', m.top?m.top[0]:'—', m.top?m.top[1]+' cut-ins':'nobody yet'],
+    ['Unnamed', m.undefPct+'%', m.undef+' still Undefined']
+  ].forEach(([label,value,note])=>{
+    const d=el('div','stat'), dd=el('dd',null,String(value));
+    dd.appendChild(el('small',null,note));
+    d.append(el('dt',null,label),dd); box.appendChild(d);
+  });
+}
+
+/* ============================================================
+   RENDER — CARDS
+   ============================================================ */
+function autoGrow(ta){ ta.style.height='auto'; ta.style.height=ta.scrollHeight+'px'; }
+
+function renderCards(){
+  const field_ = document.getElementById('field');
+  field_.textContent='';
+  const q = searchTerm.toLowerCase();
+  const rows = thoughts.map((t,i)=>({t,i})).filter(({t})=>{
+    if(filterPersona && t.persona!==filterPersona) return false;
+    if(q && !t.text.toLowerCase().includes(q) && !t.persona.toLowerCase().includes(q)) return false;
+    return true;
+  }).reverse();
+
+  if(!rows.length){ field_.appendChild(emptyState()); return; }
+
+  rows.forEach(({t,i})=>{
+    const ink = inkOf(t.persona);
+    const card = el('article','card' + (t.persona===UNDEFINED?' undef':'')
+      + (t.kind==='note'?' is-note':''));
+    card.dataset.id=t.id; card.style.borderLeftColor=ink;
+
+    const h = el('div','card-head');
+    const pb = el('button','card-persona',t.persona);
+    pb.style.color=ink; pb.title='Edit the voice on this thought';
+    pb.addEventListener('click',()=>editPersonaSheet(t));
+    h.appendChild(pb);
+    if(t.kind==='note') h.appendChild(el('span','tag soft','returned'));
+    if(i>0 && thoughts[i-1].persona!==t.persona && thoughts[i-1].sessionId===t.sessionId){
+      const s=el('span','tag','cut in');
+      s.title='Interrupted '+thoughts[i-1].persona; h.appendChild(s);
+    }
+    h.appendChild(el('span','card-time',clockOf(t.createdAt)));
+    card.appendChild(h);
+
+    const desc = descOf(t.persona);
+    if(desc) card.appendChild(el('p','card-desc',desc));
+
+    const ta = el('textarea','card-text'); ta.rows=1; ta.value=t.text;
+    ta.setAttribute('aria-label','Thought text');
+    ta.addEventListener('input',()=>autoGrow(ta));
+    ta.addEventListener('blur',async()=>{
+      const v = ta.value.trim();
+      if(v===t.text) return;
+      if(!v){ ta.value=t.text; autoGrow(ta); return; }
+      t.text=v; t.editedAt=Date.now(); await putThought(t); flash('Saved');
+    });
+    card.appendChild(ta);
+
+    if(t.parentId){
+      const p = thoughts.find(x=>x.id===t.parentId);
+      if(p) card.appendChild(el('p','card-parent','on: ' + p.text.slice(0,90)
+        + (p.text.length>90?'…':'')));
+    }
+
+    const foot = el('div','card-foot');
+    const del = el('button','mini','Delete');
+    del.addEventListener('click',()=>deleteWithUndo(t));
+    const ed = el('button','mini','Voice');
+    ed.addEventListener('click',()=>editPersonaSheet(t));
+    const dw = dwellOf(i);
+    foot.append(del,ed,el('span','card-dwell','held '+humanGap(dw.ms)+(dw.open?' +':'')));
+    card.appendChild(foot);
+
+    field_.appendChild(card);
+    requestAnimationFrame(()=>autoGrow(ta));
+  });
+}
+
+function emptyState(){
+  const d=el('div','empty');
+  if(thoughts.length){
+    d.appendChild(el('h2','Nothing matches.'));
+    d.appendChild(el('p','Clear the search or the voice filter to see the full stream.'));
+  } else {
+    d.appendChild(el('h2','The channel is quiet.'));
+    d.appendChild(el('p','Log a thought and it gets stamped with whoever is speaking right now. If you cannot tell who that is, log it anyway — it lands as Undefined, which is a real reading, not a blank.'));
+    d.appendChild(el('p','The ribbon above fills in as you go. Wide bands mean a voice held the floor. Hatched bands are the ones you have not named yet.'));
+  }
+  return d;
+}
+
+/* ============================================================
+   CHIPS
+   ============================================================ */
+function renderChips(){
+  const wrap_ = document.getElementById('persona-chips');
+  wrap_.textContent='';
+  const list = [...new Set(thoughts.map(t=>t.persona))]
+    .map(n=>[n,countOf(n)]).sort((a,b)=>b[1]-a[1]).slice(0,7);
+  list.forEach(([name,count])=>{
+    const b=el('button','chip');
+    b.setAttribute('aria-pressed',String(filterPersona===name));
+    const ink = inkOf(name);
+    if(filterPersona===name) b.style.color=ink;
+    const dot=el('span','dot');
+    if(name===UNDEFINED){ dot.style.background='transparent';
+      dot.style.boxShadow='inset 0 0 0 1px '+UNDEF_INK; }
+    else dot.style.background=ink;
+    b.append(dot, el('span',null,name+' · '+count));
+    b.title = descOf(name) || 'Filter to this voice';
+    b.addEventListener('click',()=>{
+      filterPersona = filterPersona===name ? null : name;
+      if(filterPersona) setDraft(name);
+      renderChips(); renderCards();
+    });
+    wrap_.appendChild(b);
+  });
+  const add=el('button','chip ghost');
+  add.append(el('span',null,'+ name a voice'));
+  add.addEventListener('click',()=>editPersonaSheet(null));
+  wrap_.appendChild(add);
+}
+
+/* ============================================================
+   ACTIONS
+   ============================================================ */
+function setDraft(name){
+  draftPersona = normName(name);
+  const input = document.getElementById('persona-input');
+  input.value = draftPersona===UNDEFINED ? '' : draftPersona;
+  paintSwatch();
+}
+function paintSwatch(){
+  const sw = document.getElementById('persona-swatch');
+  const known = personas[draftPersona];
+  if(draftPersona===UNDEFINED || !known){
+    sw.style.background='transparent';
+    sw.style.boxShadow='inset 0 0 0 1px '+UNDEF_INK;
+  } else {
+    sw.style.background=known.ink;
+    sw.style.boxShadow='0 0 0 1px rgba(0,0,0,.5)';
+  }
+}
+
+async function addThought(){
+  const ta = document.getElementById('new-thought');
+  const text = ta.value.trim(); if(!text) return;
+  const name = draftPersona;
+  await commitPersona(name);                 // committed HERE, not per keystroke
+  const t = {
+    id: String(Date.now())+'-'+Math.random().toString(36).slice(2,7),
+    text, persona:name, createdAt:Date.now(), editedAt:null,
+    sessionId:null, parentId:null, kind:'thought'
+  };
+  thoughts.push(t); resequence(); await putThought(t);
+  ta.value=''; autoGrow(ta);
+  document.getElementById('add-thought').disabled=true;
+  renderAll();
+  flash(name===UNDEFINED ? 'Logged as Undefined' : 'Logged as '+name);
+}
+
+function deleteWithUndo(t){
+  const idx = thoughts.findIndex(x=>x.id===t.id);
+  thoughts.splice(idx,1);
+  removeThought(t.id).then(pruneOrphans).then(renderAll);
+  renderAll();
+  flash('Thought removed','Undo',async()=>{
+    thoughts.splice(idx,0,t); resequence();
+    await commitPersona(t.persona); await putThought(t);
+    renderAll(); flash('Restored');
+  });
+}
+
+function flash(msg,label,fn){
+  const toast=document.getElementById('toast');
+  const btn=document.getElementById('toast-action');
+  document.getElementById('toast-msg').textContent=msg;
+  clearTimeout(toastTimer);
+  if(label){ btn.hidden=false; btn.textContent=label;
+    btn.onclick=()=>{toast.classList.remove('show'); fn&&fn();}; }
+  else { btn.hidden=true; btn.onclick=null; }
+  toast.classList.add('show');
+  toastTimer=setTimeout(()=>toast.classList.remove('show'), label?6500:2000);
+}
+
+/* ============================================================
+   EXPORT / IMPORT
+   ============================================================ */
+function payload(){
+  const live = new Set(thoughts.map(t=>t.persona));
+  const clean = {};
+  Object.keys(personas).forEach(n=>{ if(live.has(n)) clean[n]=personas[n]; });
+  const sessions = [];
+  thoughts.forEach(t=>{
+    let s = sessions.find(x=>x.id===t.sessionId);
+    if(!s){ sessions.push(s={id:t.sessionId,startedAt:t.createdAt,endedAt:t.createdAt,count:0,note:null}); }
+    s.endedAt = t.createdAt; s.count++;
+  });
+  return {
+    format:'thought-mapper', version:3,
+    exportedAt:new Date().toISOString(),
+    reviewerPersona: settings.reviewerPersona||null,
+    sessionGapMs: settings.sessionGapMs,
+    personas: clean, sessions, thoughts
+  };
+}
+function download(name,text,mime){
+  const url=URL.createObjectURL(new Blob([text],{type:mime}));
+  const a=document.createElement('a'); a.href=url; a.download=name; a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),1500);
+}
+function exportJSON(){
+  download('thought-map-'+new Date().toISOString().slice(0,10)+'.json',
+    JSON.stringify(payload(),null,2),'application/json');
+  flash('Backup downloaded');
+}
+
+async function importJSON(file){
+  let data;
+  try{ data = JSON.parse(await file.text()); }
+  catch(e){ flash('Could not read that file'); return; }
+  const incoming = Array.isArray(data.thoughts)?data.thoughts:[];
+  if(!incoming.length){ flash('No thoughts in that file'); return; }
+
+  // personas: v3 objects, or v2 ink map — but ONLY those a thought references,
+  // which discards the v2 keystroke ink leak automatically.
+  const referenced = new Set(incoming.map(t=>normName(t.persona)));
+  if(data.personas){
+    Object.values(data.personas).forEach(p=>{
+      if(referenced.has(p.name) && !personas[p.name]) personas[p.name]=p;
+    });
+  } else if(data.personaInk){
+    Object.entries(data.personaInk).forEach(([n,ink])=>{
+      if(referenced.has(n) && !personas[n])
+        personas[n]={name:n,description:'',ink,createdAt:Date.now()};
+    });
+  }
+
+  const have = new Set(thoughts.map(t=>t.id));
+  let added=0, notes=0, reviewed=0;
+  for(const raw of incoming){
+    const id = String(raw.id);
+    const name = normName(raw.persona);
+    if(!have.has(id)){
+      const t = {
+        id, text:String(raw.text||''), persona:name,
+        createdAt:Number(raw.createdAt)||Date.now(),
+        editedAt:raw.editedAt||null, sessionId:null,
+        parentId:raw.parentId||null, kind:raw.kind||'thought'
+      };
+      thoughts.push(t); have.add(id); added++;
+    }
+    // A review note returns to the stream only if it was promoted.
+    if(raw.review && String(raw.review).trim()){
+      reviewed++;
+      if(raw.promote){
+        const nid = id+'-n';
+        if(!have.has(nid)){
+          const rp = normName(data.reviewerPersona || settings.reviewerPersona || '');
+          const n = {
+            id:nid, text:String(raw.review).trim(), persona:rp,
+            createdAt:Date.parse(data.reviewedAt||data.exportedAt||'')||Date.now(),
+            editedAt:null, sessionId:null, parentId:id, kind:'note'
+          };
+          thoughts.push(n); have.add(nid); notes++;
+        }
+      }
+    }
+  }
+  for(const n of new Set(thoughts.map(t=>t.persona))) await commitPersona(n);
+  resequence();
+  for(const t of thoughts) await putThought(t);
+  const pruned = await pruneOrphans();
+  renderAll();
+  let msg = 'Merged '+added+' thought'+(added===1?'':'s');
+  if(notes)  msg += ' · '+notes+' note'+(notes===1?'':'s')+' returned';
+  if(reviewed && !notes) msg += ' · '+reviewed+' review'+(reviewed===1?'':'s')+' not promoted';
+  if(pruned) msg += ' · '+pruned+' orphan voice'+(pruned===1?'':'s')+' pruned';
+  flash(msg);
+}
+
+/* ------------------------------------------------------------
+   SELF-CONTAINED REVIEW PAGE (format v3)
+   ------------------------------------------------------------ */
+function exportReviewHTML(){
+  if(!thoughts.length){ flash('Nothing to export yet'); return; }
+  const data = JSON.stringify(payload()).replace(/</g,'\\u003c');
+  const stamp = new Date().toISOString().slice(0,10);
+
+  const doc = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Thought Flow Review — ${stamp}</title>
+<!--
+  THOUGHT FLOW REVIEW PAGE  ·  format v3
+  1. Date created .... ${stamp}
+  2. Tool ............ Claude Opus 5 — emitted by Thought Mapper (Drift Instrument) v3
+  3. Prompt .......... Auto-generated export. The review layer is written after the
+                       fact by the reader. Notes persist in this page's own
+                       localStorage. Marking a note "return to stream" promotes it
+                       back into the thought record on re-import, carrying a
+                       parentId to what it was written about.
+  4. README .......... see README.md in the thought-map repository
+-->
+<style>
+:root{--ink:#12141c;--raised:#191c26;--sunk:#0d0f16;--line:#262b3a;--bright:#394054;
+--paper:#e8e6e1;--dim:#a7abbb;--muted:#6c7288;--accent:#4e9a96;
+--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+--serif:"Iowan Old Style",Palatino,Georgia,serif}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ink);color:var(--paper);font-family:var(--mono);
+font-size:15px;line-height:1.5;padding-bottom:env(safe-area-inset-bottom)}
+.wrap{max-width:820px;margin:0 auto;padding:clamp(16px,4vw,34px)}
+h1{font-size:15px;letter-spacing:.24em;text-transform:uppercase;font-weight:500;margin:0}
+.sub{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:6px 0 20px}
+.who-field{background:var(--raised);border:1px solid var(--line);border-radius:3px;
+padding:12px 14px;margin-bottom:20px}
+.who-field label{display:block;font-size:9px;letter-spacing:.17em;text-transform:uppercase;
+color:var(--muted);margin-bottom:6px}
+.who-field input{width:100%;min-height:42px;background:var(--sunk);color:var(--paper);
+border:1px solid var(--line);border-radius:3px;padding:9px 11px;font:inherit;font-size:13px}
+.who-field p{font-size:10px;color:var(--muted);margin:7px 0 0;line-height:1.5}
+.ribbon{display:flex;flex-wrap:wrap;gap:2px;padding:10px;background:var(--sunk);
+border:1px solid var(--line);border-radius:3px;margin-bottom:10px;align-items:flex-end}
+.seg{height:20px;border-radius:1px}
+.seg.u{background-image:repeating-linear-gradient(45deg,#6c7288 0 2px,transparent 2px 5px);
+background-color:rgba(108,114,136,.18);box-shadow:inset 0 0 0 1px rgba(108,114,136,.5)}
+.seg.o{-webkit-mask-image:linear-gradient(to right,#000 55%,transparent);
+mask-image:linear-gradient(to right,#000 55%,transparent)}
+.brk{height:20px;padding:0 4px;color:var(--muted);font-size:9px;letter-spacing:.12em;
+border-left:1px dotted var(--bright);display:flex;align-items:center}
+.stats{display:flex;flex-wrap:wrap;gap:16px;font-size:11px;letter-spacing:.1em;
+color:var(--muted);text-transform:uppercase;margin-bottom:24px}
+.stats b{color:var(--paper);font-weight:500}
+.shead{font-size:10px;letter-spacing:.18em;text-transform:uppercase;color:var(--muted);
+margin:26px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line);
+display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.snote{width:100%;background:var(--sunk);color:var(--paper);border:1px solid var(--line);
+border-radius:3px;padding:9px 10px;font-family:var(--mono);font-size:12px;
+min-height:38px;resize:vertical;margin-bottom:16px}
+.entry{background:var(--raised);border:1px solid var(--line);border-left:3px solid var(--muted);
+border-radius:3px;padding:13px 15px;margin-bottom:14px}
+.entry.u{border-left-style:dashed}
+.meta{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-bottom:6px}
+.who{font-size:10px;letter-spacing:.15em;text-transform:uppercase}
+.when{font-size:10px;color:var(--muted);margin-left:auto;letter-spacing:.07em}
+.cut{font-size:9px;letter-spacing:.13em;text-transform:uppercase;background:var(--paper);
+color:var(--ink);padding:1px 5px;border-radius:2px}
+.desc{font-size:10px;color:var(--muted);font-style:italic;font-family:var(--serif);
+margin:0 0 8px;line-height:1.4}
+.said{font-family:var(--serif);font-size:16px;line-height:1.55;margin:0;white-space:pre-wrap}
+.note{margin-top:11px;padding-top:10px;border-top:1px dashed var(--line)}
+.note label{font-size:9px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);
+display:block;margin-bottom:6px}
+.note textarea{width:100%;min-height:38px;background:var(--sunk);color:var(--paper);
+border:1px solid var(--line);border-radius:2px;padding:8px 9px;font-family:var(--mono);
+font-size:13px;line-height:1.45;resize:vertical}
+.note textarea:focus{outline:1px solid var(--accent);border-color:var(--accent)}
+.promote{display:none;gap:9px;align-items:flex-start;margin-top:9px;cursor:pointer}
+.promote.on{display:flex}
+.promote input{width:17px;height:17px;margin:1px 0 0;flex:0 0 auto;accent-color:var(--accent)}
+.promote span{font-size:11px;color:var(--muted);line-height:1.5}
+.promote b{color:var(--dim);font-weight:500}
+.bar{position:sticky;bottom:0;background:linear-gradient(to top,var(--ink) 68%,transparent);
+padding:16px 0;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+button{background:transparent;border:1px solid var(--line);color:var(--dim);border-radius:3px;
+padding:10px 15px;min-height:44px;cursor:pointer;font-family:var(--mono);font-size:11px;
+letter-spacing:.12em;text-transform:uppercase}
+button:hover{border-color:var(--bright);color:var(--paper)}
+button.solid{background:var(--paper);color:var(--ink);border-color:var(--paper);font-weight:600}
+.saved{font-size:10px;color:var(--accent);letter-spacing:.12em}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style></head><body><div class="wrap">
+<h1>Thought Flow Review</h1>
+<p class="sub">Frozen ${stamp} · read it back as someone else</p>
+
+<div class="who-field">
+  <label for="rev">Reviewing as</label>
+  <input id="rev" type="text" placeholder="Who is reading this back?">
+  <p>The observer has a persona too. Any note you return to the stream is stamped with this name.</p>
+</div>
+
+<div class="ribbon" id="ribbon"></div>
+<div class="stats" id="stats"></div>
+<div id="entries"></div>
+
+<div class="bar">
+  <button id="save" class="solid">Save notes</button>
+  <button id="dump">Export notes JSON</button>
+  <span class="saved" id="saved"></span>
+</div>
+</div>
+<script>
+const DATA = ${data};
+const KEY = 'tm-review-' + (DATA.exportedAt||'x');
+const UND = 'Undefined';
+const GAP = DATA.sessionGapMs || 7200000;
+let S = { reviewer:'', notes:{}, promote:{}, sessionNotes:{} };
+try{ S = Object.assign(S, JSON.parse(localStorage.getItem(KEY)||'{}')); }catch(e){}
+
+const ts = DATA.thoughts.slice().sort((a,b)=>a.createdAt-b.createdAt);
+const ink = n => n===UND ? '#6c7288' : ((DATA.personas&&DATA.personas[n]&&DATA.personas[n].ink)||'#6c7288');
+const desc = n => (DATA.personas&&DATA.personas[n]&&DATA.personas[n].description)||'';
+const gap = ms => { const s=Math.round(ms/1000); if(s<60)return s+'s';
+  const m=Math.round(s/60); if(m<60)return m+'m';
+  const h=Math.round(m/60); if(h<48)return h+'h'; return Math.round(h/24)+'d'; };
+const sameSession = (a,b) => a && b && a.sessionId===b.sessionId;
+function dwell(i){
+  const t=ts[i], n=ts[i+1];
+  if(!n) return {ms:Math.min(Date.now()-t.createdAt,GAP),open:true};
+  if(!sameSession(t,n)) return {ms:GAP/6,open:true};
+  return {ms:n.createdAt-t.createdAt,open:false};
+}
+
+// ribbon
+const dw = ts.map((_,i)=>dwell(i));
+const mx = Math.max.apply(null,dw.map(d=>d.ms).concat([1]));
+const rb = document.getElementById('ribbon');
+ts.forEach((t,i)=>{
+  if(i>0 && !sameSession(ts[i-1],t)){
+    const b=document.createElement('span'); b.className='brk';
+    b.textContent='⟋ '+gap(t.createdAt-ts[i-1].createdAt);
+    b.title='Session break'; rb.appendChild(b);
+  }
+  const d=document.createElement('div');
+  d.className='seg'+(t.persona===UND?' u':'')+(dw[i].open?' o':'');
+  d.style.width=Math.round(9+Math.sqrt(dw[i].ms/mx)*92)+'px';
+  if(t.persona!==UND) d.style.background=ink(t.persona);
+  d.title=t.persona+' · '+gap(dw[i].ms);
+  rb.appendChild(d);
+});
+
+let sw=0; for(let i=1;i<ts.length;i++) if(ts[i].persona!==ts[i-1].persona) sw++;
+const sessions = new Set(ts.map(t=>t.sessionId)).size;
+document.getElementById('stats').innerHTML =
+  '<span><b>'+ts.length+'</b> thoughts</span>'+
+  '<span><b>'+new Set(ts.map(t=>t.persona)).size+'</b> voices</span>'+
+  '<span><b>'+(ts.length>1?Math.round(sw/(ts.length-1)*100):0)+'%</b> switch rate</span>'+
+  '<span><b>'+ts.filter(t=>t.persona===UND).length+'</b> undefined</span>'+
+  '<span><b>'+sessions+'</b> session'+(sessions===1?'':'s')+'</span>';
+
+const revIn = document.getElementById('rev');
+revIn.value = S.reviewer || DATA.reviewerPersona || '';
+revIn.addEventListener('input',()=>{ S.reviewer=revIn.value; });
+
+const box = document.getElementById('entries');
+let lastSid = null;
+ts.forEach((t,i)=>{
+  if(t.sessionId !== lastSid){
+    lastSid = t.sessionId;
+    const sMeta = (DATA.sessions||[]).find(s=>s.id===t.sessionId);
+    const h=document.createElement('div'); h.className='shead';
+    const a=document.createElement('span');
+    a.textContent='Session — '+new Date(t.createdAt).toLocaleString();
+    const b=document.createElement('span');
+    b.textContent=(sMeta?sMeta.count:'?')+' thoughts · '
+      +(sMeta?gap(sMeta.endedAt-sMeta.startedAt):'');
+    h.append(a,b); box.appendChild(h);
+    const sn=document.createElement('textarea'); sn.className='snote';
+    sn.placeholder='Note on this whole session — what was the shape of it?';
+    sn.value=S.sessionNotes[t.sessionId]||'';
+    sn.addEventListener('input',()=>{ S.sessionNotes[t.sessionId]=sn.value; });
+    box.appendChild(sn);
+  }
+  const e=document.createElement('article');
+  e.className='entry'+(t.persona===UND?' u':'');
+  e.style.borderLeftColor=ink(t.persona);
+  const m=document.createElement('div'); m.className='meta';
+  const w=document.createElement('span'); w.className='who';
+  w.style.color=ink(t.persona); w.textContent=t.persona; m.appendChild(w);
+  if(i>0 && ts[i-1].persona!==t.persona && sameSession(ts[i-1],t)){
+    const c=document.createElement('span'); c.className='cut'; c.textContent='cut in';
+    m.appendChild(c);
+  }
+  const wh=document.createElement('span'); wh.className='when';
+  wh.textContent=new Date(t.createdAt).toLocaleTimeString()+' · held '+gap(dw[i].ms)+(dw[i].open?' +':'');
+  m.appendChild(wh); e.appendChild(m);
+  const dd=desc(t.persona);
+  if(dd){ const p=document.createElement('p'); p.className='desc'; p.textContent=dd; e.appendChild(p); }
+  const p=document.createElement('p'); p.className='said'; p.textContent=t.text; e.appendChild(p);
+
+  const n=document.createElement('div'); n.className='note';
+  const l=document.createElement('label'); l.textContent='Review note';
+  const ta=document.createElement('textarea');
+  ta.placeholder='What do you notice now that you did not then?';
+  ta.value=S.notes[t.id]||'';
+  const pr=document.createElement('label'); pr.className='promote';
+  const cb=document.createElement('input'); cb.type='checkbox'; cb.checked=!!S.promote[t.id];
+  const sp=document.createElement('span');
+  const bb=document.createElement('b'); bb.textContent='Return this to the stream';
+  sp.appendChild(bb);
+  sp.appendChild(document.createTextNode(' — it becomes a real thought on re-import, stamped with your reviewer name and linked back to this one.'));
+  pr.append(cb,sp);
+  if(ta.value.trim()) pr.classList.add('on');
+  ta.addEventListener('input',()=>{
+    S.notes[t.id]=ta.value;
+    pr.classList.toggle('on', !!ta.value.trim());
+    if(!ta.value.trim()){ cb.checked=false; S.promote[t.id]=false; }
+  });
+  cb.addEventListener('change',()=>{ S.promote[t.id]=cb.checked; });
+  n.append(l,ta,pr); e.appendChild(n); box.appendChild(e);
+});
+
+function persist(){
+  const tag=document.getElementById('saved');
+  try{ localStorage.setItem(KEY,JSON.stringify(S));
+    tag.textContent='Saved'; setTimeout(()=>tag.textContent='',1800); }
+  catch(err){ tag.textContent='Save blocked — export instead'; }
+}
+document.getElementById('save').onclick=persist;
+window.addEventListener('beforeunload',persist);
+document.getElementById('dump').onclick=function(){
+  persist();
+  const out=Object.assign({},DATA,{
+    reviewedAt:new Date().toISOString(),
+    reviewerPersona:(S.reviewer||'').trim()||null,
+    sessions:(DATA.sessions||[]).map(s=>Object.assign({},s,{note:S.sessionNotes[s.id]||null})),
+    thoughts:DATA.thoughts.map(t=>Object.assign({},t,{
+      review:S.notes[t.id]||null, promote:!!S.promote[t.id]
+    }))
+  });
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([JSON.stringify(out,null,2)],{type:'application/json'}));
+  a.download='thought-review-${stamp}.json'; a.click();
+};
+<\/script></body></html>`;
+
+  download('thought-review-'+stamp+'.html', doc, 'text/html');
+  flash('Review page downloaded');
+}
+
+/* ============================================================
+   WIRING
+   ============================================================ */
+function renderAll(){
+  resequence(); renderRibbon(); renderReadout(); renderChips(); renderCards();
+}
+function wire(){
+  const pIn=document.getElementById('persona-input');
+  const nt=document.getElementById('new-thought');
+  const add=document.getElementById('add-thought');
+
+  // Draft only — no storage write, no ink allocation. This is the v2 fix.
+  pIn.addEventListener('input',()=>{ draftPersona=normName(pIn.value); paintSwatch(); });
+  pIn.addEventListener('keydown',e=>{
+    if(e.key==='Enter'){ e.preventDefault(); nt.focus(); }
+  });
+
+  nt.addEventListener('input',()=>{ autoGrow(nt); add.disabled=!nt.value.trim(); });
+  nt.addEventListener('keydown',e=>{
+    if((e.metaKey||e.ctrlKey)&&e.key==='Enter'){ e.preventDefault(); addThought(); }
+  });
+  add.addEventListener('click',addThought);
+
+  document.getElementById('search').addEventListener('input',e=>{
+    searchTerm=e.target.value; renderCards();
+  });
+  document.getElementById('btn-voices').addEventListener('click',voicesSheet);
+  document.getElementById('btn-settings').addEventListener('click',settingsSheet);
+  document.getElementById('btn-export-json').addEventListener('click',exportJSON);
+  document.getElementById('btn-export-html').addEventListener('click',exportReviewHTML);
+  document.getElementById('btn-import').addEventListener('click',()=>
+    document.getElementById('file-input').click());
+  document.getElementById('file-input').addEventListener('change',e=>{
+    if(e.target.files[0]) importJSON(e.target.files[0]);
+    e.target.value='';
+  });
+}
+
+async function boot(){
+  wire(); setDraft(UNDEFINED);
+  try{
+    db = await openDB();
+    const s = await readMeta('settings');
+    if(s) settings = Object.assign(settings,s);
+    (await readPersonas()).forEach(p=>{ personas[p.name]=p; });
+    thoughts = await readThoughts();
+    // v2 ink map, if one survives, becomes persona objects.
+    const legacy = await readMeta('personaInk');
+    if(legacy){
+      Object.entries(legacy).forEach(([n,ink])=>{
+        if(!personas[n]) personas[n]={name:n,description:'',ink,createdAt:Date.now()};
+      });
+    }
+    thoughts.forEach(t=>{ if(!t.kind) t.kind='thought'; if(!('parentId' in t)) t.parentId=null; });
+    const pruned = await pruneOrphans();     // clears any legacy keystroke leak
+    if(pruned) setTimeout(()=>flash(pruned+' orphan voice'+(pruned===1?'':'s')+' cleared'),700);
+  }catch(err){
+    console.error('Storage unavailable:',err);
+    flash('Storage is blocked — nothing will be saved this session');
+    thoughts=[];
+  }
+  setDraft(UNDEFINED);
+  renderAll();
+}
+boot();
+</script>
+</body>
+</html>
